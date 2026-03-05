@@ -9,14 +9,15 @@ Run with:
 from __future__ import annotations
 
 import datetime as dt
+import json
 import socket
 import ssl
 import sys
 import textwrap
 import warnings
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from select import select
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import click
@@ -39,20 +40,20 @@ Remediation Guide
 1) HNDL mitigation (Harvest Now, Decrypt Later):
    - Enable hybrid post-quantum key exchange in your TLS terminator.
    - Prioritise NIST standardised ML-KEM based hybrid groups where supported.
-   - Confirm negotiation with test clients and monitor fallback behaviour.
+   - Validate negotiation with test clients and monitor fallback behaviour.
 
-2) Grover's vulnerability mitigation:
+2) Grover vulnerability mitigation:
    - Prefer AES-256-GCM or ChaCha20-Poly1305 where appropriate.
    - De-prioritise AES-128 in modern policy sets.
 
-3) Shor's vulnerability mitigation:
+3) Shor vulnerability mitigation:
    - Replace RSA keys below 3072 bits.
    - Replace legacy ECC curves with stronger migration plans and PQC transition.
 
 4) General TLS hygiene:
    - Disable TLS 1.0 and TLS 1.1.
    - Keep certificate rotation short and automated.
-   - Provide OCSP and CRL endpoints for revocation ecosystem support.
+   - Publish OCSP and CRL endpoints and monitor their availability.
 """.strip()
 
 
@@ -62,6 +63,7 @@ class AuditRow:
     current_state: str
     quantum_status: str
     remediation: str
+    risk_band: str
 
 
 @dataclass
@@ -74,7 +76,7 @@ class TlsSnapshot:
     cert_der: bytes
 
 
-def normalise_target(url: str) -> tuple[str, int]:
+def normalise_target(url: str) -> tuple[str, int, str]:
     candidate = url if "://" in url else f"https://{url}"
     parsed = urlparse(candidate)
 
@@ -85,63 +87,96 @@ def normalise_target(url: str) -> tuple[str, int]:
     if not host:
         raise click.ClickException("Could not parse host from URL.")
 
+    try:
+        host_ascii = host.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise click.ClickException(f"Host IDNA normalisation failed for {host}: {exc}") from exc
+
     port = parsed.port or 443
-    return host, port
+    return host_ascii, port, host
 
 
 def resolve_host(host: str) -> str:
     try:
-        return socket.gethostbyname(host)
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        for info in infos:
+            af, _, _, _, sa = info
+            if af in (socket.AF_INET, socket.AF_INET6):
+                return sa[0]
     except socket.gaierror as exc:
         raise click.ClickException(f"DNS resolution failed for {host}: {exc}") from exc
+    raise click.ClickException(f"No usable IP address resolved for {host}.")
 
 
 def open_tcp_non_blocking(host: str, port: int, timeout: float) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setblocking(False)
-    err = sock.connect_ex((host, port))
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not infos:
+        raise click.ClickException(f"No TCP socket candidates found for {host}:{port}.")
 
-    if err not in (0, 115, 10035):
-        sock.close()
-        raise click.ClickException(f"TCP connection failed with errno {err}.")
+    last_error: Optional[str] = None
+    for af, socktype, proto, _, sa in infos:
+        sock = socket.socket(af, socktype, proto)
+        sock.setblocking(False)
+        err = sock.connect_ex(sa)
 
-    _, writable, _ = select([], [sock], [], timeout)
-    if not writable:
-        sock.close()
-        raise click.ClickException("TCP connection timed out.")
+        in_progress = {0, 115, 10035}
+        if err not in in_progress:
+            last_error = f"errno {err}"
+            sock.close()
+            continue
 
-    so_error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-    if so_error != 0:
-        sock.close()
-        raise click.ClickException(f"TCP socket error: {so_error}")
+        _, writable, _ = select([], [sock], [], timeout)
+        if not writable:
+            last_error = "TCP connection timed out"
+            sock.close()
+            continue
 
-    return sock
+        so_error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if so_error != 0:
+            last_error = f"TCP socket error {so_error}"
+            sock.close()
+            continue
+
+        return sock
+
+    raise click.ClickException(f"TCP connection failed for {host}:{port}: {last_error}")
+
+
+def build_context(insecure: bool, cafile: Optional[str]) -> ssl.SSLContext:
+    if insecure:
+        ctx = ssl._create_unverified_context()
+        ctx.check_hostname = False
+        return ctx
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+    if cafile:
+        ctx.load_verify_locations(cafile=cafile)
+    else:
+        ctx.load_default_certs()
+    return ctx
 
 
 def do_tls_handshake_non_blocking(
     raw_sock: socket.socket,
     host: str,
     timeout: float,
+    context: ssl.SSLContext,
     min_version: Optional[ssl.TLSVersion] = None,
     max_version: Optional[ssl.TLSVersion] = None,
 ) -> ssl.SSLSocket:
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    ctx.check_hostname = True
-    ctx.load_default_certs()
-
     if min_version:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            ctx.minimum_version = min_version
+            context.minimum_version = min_version
     if max_version:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            ctx.maximum_version = max_version
+            context.maximum_version = max_version
 
-    tls_sock = ctx.wrap_socket(raw_sock, server_hostname=host, do_handshake_on_connect=False)
+    tls_sock = context.wrap_socket(raw_sock, server_hostname=host, do_handshake_on_connect=False)
     tls_sock.setblocking(False)
-
     deadline = dt.datetime.now(dt.timezone.utc).timestamp() + timeout
 
     while True:
@@ -165,16 +200,15 @@ def do_tls_handshake_non_blocking(
             raise click.ClickException(f"TLS handshake failed: {exc}") from exc
 
 
-def capture_tls_snapshot(host: str, port: int, timeout: float) -> TlsSnapshot:
+def capture_tls_snapshot(host: str, port: int, timeout: float, insecure: bool, cafile: Optional[str]) -> TlsSnapshot:
     ip = resolve_host(host)
     raw = open_tcp_non_blocking(ip, port, timeout)
 
     try:
-        tls = do_tls_handshake_non_blocking(raw, host, timeout)
+        tls = do_tls_handshake_non_blocking(raw, host, timeout, build_context(insecure, cafile))
         cipher_tuple = tls.cipher() or ("Unknown", "", 0)
         cert = tls.getpeercert(binary_form=True)
         version = tls.version() or "Unknown"
-        cipher = cipher_tuple[0]
         tls.close()
     finally:
         try:
@@ -185,20 +219,28 @@ def capture_tls_snapshot(host: str, port: int, timeout: float) -> TlsSnapshot:
     if not cert:
         raise click.ClickException("No peer certificate received.")
 
-    return TlsSnapshot(
-        host=host,
-        port=port,
-        ip=ip,
-        tls_version=version,
-        cipher_name=cipher,
-        cert_der=cert,
-    )
+    return TlsSnapshot(host=host, port=port, ip=ip, tls_version=version, cipher_name=cipher_tuple[0], cert_der=cert)
 
 
-def supports_weak_version(host: str, ip: str, port: int, version: ssl.TLSVersion, timeout: float) -> bool:
+def supports_legacy_version(
+    host: str,
+    ip: str,
+    port: int,
+    version: ssl.TLSVersion,
+    timeout: float,
+    insecure: bool,
+    cafile: Optional[str],
+) -> bool:
     raw = open_tcp_non_blocking(ip, port, timeout)
     try:
-        tls = do_tls_handshake_non_blocking(raw, host, timeout, min_version=version, max_version=version)
+        tls = do_tls_handshake_non_blocking(
+            raw,
+            host,
+            timeout,
+            build_context(insecure, cafile),
+            min_version=version,
+            max_version=version,
+        )
         tls.close()
         return True
     except click.ClickException:
@@ -222,16 +264,18 @@ def assess_hndl(cipher_name: str) -> AuditRow:
     if any(token in upper for token in PQC_KEYWORDS):
         return AuditRow(
             field="Key Exchange",
-            current_state=cipher_name,
-            quantum_status="Aligned with hybrid PQC signals",
+            current_state=f"{cipher_name} (cipher naming signal)",
+            quantum_status="Lower HNDL exposure signal observed",
             remediation="Maintain ML-KEM or Kyber hybrid preference order",
+            risk_band="Transition",
         )
 
     return AuditRow(
         field="Key Exchange",
-        current_state=cipher_name,
-        quantum_status="CRITICAL: Vulnerable to HNDL",
-        remediation="Enable hybrid ML-KEM or Kyber key exchange support",
+        current_state=f"{cipher_name} (no hybrid marker in cipher name)",
+        quantum_status="CRITICAL: Vulnerable to HNDL under current policy",
+        remediation="Enable hybrid ML-KEM or Kyber key exchange and verify with TLS group-aware tooling",
+        risk_band="Immediate",
     )
 
 
@@ -243,6 +287,7 @@ def assess_grover(cipher_name: str) -> AuditRow:
             current_state="AES-128 negotiated",
             quantum_status="MEDIUM: Grover effective strength reduction",
             remediation="Prioritise AES-256 suites in TLS policy",
+            risk_band="Transition",
         )
 
     if "AES256" in name or "AES_256" in name:
@@ -251,6 +296,7 @@ def assess_grover(cipher_name: str) -> AuditRow:
             current_state="AES-256 negotiated",
             quantum_status="Stronger posture",
             remediation="Keep AES-256 prioritised",
+            risk_band="Long-term",
         )
 
     if "CHACHA20" in name:
@@ -259,6 +305,7 @@ def assess_grover(cipher_name: str) -> AuditRow:
             current_state="ChaCha20-Poly1305 negotiated",
             quantum_status="Generally robust modern choice",
             remediation="Keep modern AEAD priority with AES-256 where practical",
+            risk_band="Long-term",
         )
 
     return AuditRow(
@@ -266,6 +313,7 @@ def assess_grover(cipher_name: str) -> AuditRow:
         current_state=cipher_name,
         quantum_status="Unknown strength profile",
         remediation="Review cipher policy and prefer AES-256 or ChaCha20",
+        risk_band="Transition",
     )
 
 
@@ -279,13 +327,15 @@ def assess_shor(cert: x509.Certificate) -> AuditRow:
                 field="Certificate Public Key",
                 current_state=f"RSA {bits}",
                 quantum_status="HIGH: Shor vulnerable and below 3072-bit target",
-                remediation="Issue certificate with RSA 3072+ or PQ transition strategy",
+                remediation="Issue certificate with RSA 3072+ and define a PQ migration strategy",
+                risk_band="Immediate",
             )
         return AuditRow(
             field="Certificate Public Key",
             current_state=f"RSA {bits}",
             quantum_status="Classical baseline improved, still Shor vulnerable",
             remediation="Plan PQ-safe certificate migration track",
+            risk_band="Long-term",
         )
 
     if isinstance(pub, ec.EllipticCurvePublicKey):
@@ -299,6 +349,7 @@ def assess_shor(cert: x509.Certificate) -> AuditRow:
             current_state=f"ECC {curve_name} ({bits} bits)",
             quantum_status=status,
             remediation="Prepare PQ certificate and signature migration roadmap",
+            risk_band="Long-term",
         )
 
     return AuditRow(
@@ -306,45 +357,26 @@ def assess_shor(cert: x509.Certificate) -> AuditRow:
         current_state=pub.__class__.__name__,
         quantum_status="Unknown algorithm type",
         remediation="Validate certificate key algorithm against PQ migration plan",
+        risk_band="Transition",
     )
 
 
-def assess_tls_health(
-    cert: x509.Certificate,
-    tls_version: str,
-    weak_tls10: bool,
-    weak_tls11: bool,
-) -> list[AuditRow]:
+def assess_tls_health(cert: x509.Certificate, tls_version: str, weak_tls10: bool, weak_tls11: bool) -> list[AuditRow]:
     rows: list[AuditRow] = []
 
     now = dt.datetime.now(dt.timezone.utc)
     not_after = getattr(cert, "not_valid_after_utc", None)
     if not_after is None:
         legacy_not_after = cert.not_valid_after
-        if legacy_not_after.tzinfo is None:
-            not_after = legacy_not_after.replace(tzinfo=dt.timezone.utc)
-        else:
-            not_after = legacy_not_after.astimezone(dt.timezone.utc)
+        not_after = legacy_not_after.replace(tzinfo=dt.timezone.utc) if legacy_not_after.tzinfo is None else legacy_not_after.astimezone(dt.timezone.utc)
     days_remaining = (not_after - now).days
 
     if days_remaining < 0:
-        expiry_status = "CRITICAL: Certificate expired"
-        expiry_remediation = "Renew certificate immediately"
+        rows.append(AuditRow("Certificate Expiry", f"Expires {not_after.isoformat()} ({days_remaining} days)", "CRITICAL: Certificate expired", "Renew certificate immediately", "Immediate"))
     elif days_remaining <= 30:
-        expiry_status = "HIGH: Certificate near expiry"
-        expiry_remediation = "Renew within current change window"
+        rows.append(AuditRow("Certificate Expiry", f"Expires {not_after.isoformat()} ({days_remaining} days)", "HIGH: Certificate near expiry", "Renew within current change window", "Immediate"))
     else:
-        expiry_status = "Healthy validity window"
-        expiry_remediation = "Maintain automated rotation"
-
-    rows.append(
-        AuditRow(
-            field="Certificate Expiry",
-            current_state=f"Expires {not_after.isoformat()} ({days_remaining} days)",
-            quantum_status=expiry_status,
-            remediation=expiry_remediation,
-        )
-    )
+        rows.append(AuditRow("Certificate Expiry", f"Expires {not_after.isoformat()} ({days_remaining} days)", "Healthy validity window", "Maintain automated rotation", "Long-term"))
 
     weak_versions = []
     if weak_tls10:
@@ -356,9 +388,10 @@ def assess_tls_health(
         rows.append(
             AuditRow(
                 field="TLS Versions",
-                current_state=f"Weak protocol support detected: {', '.join(weak_versions)}",
+                current_state=f"Legacy protocol support detected: {', '.join(weak_versions)}",
                 quantum_status="HIGH: Legacy protocol exposure",
                 remediation="Disable TLS 1.0 and TLS 1.1 on all endpoints",
+                risk_band="Immediate",
             )
         )
     else:
@@ -368,17 +401,15 @@ def assess_tls_health(
                 current_state=f"Negotiated {tls_version}; no TLS 1.0 or 1.1 acceptance observed",
                 quantum_status="Modern baseline observed",
                 remediation="Continue version hardening and periodic verification",
+                risk_band="Long-term",
             )
         )
 
     has_ocsp = False
     has_crl = False
-
     try:
         aia = cert.extensions.get_extension_for_class(x509.AuthorityInformationAccess).value
-        for desc in aia:
-            if desc.access_method == x509.AuthorityInformationAccessOID.OCSP:
-                has_ocsp = True
+        has_ocsp = any(desc.access_method == x509.AuthorityInformationAccessOID.OCSP for desc in aia)
     except x509.ExtensionNotFound:
         pass
 
@@ -389,17 +420,18 @@ def assess_tls_health(
         pass
 
     if has_ocsp or has_crl:
-        state = []
+        refs = []
         if has_ocsp:
-            state.append("OCSP")
+            refs.append("OCSP")
         if has_crl:
-            state.append("CRL")
+            refs.append("CRL")
         rows.append(
             AuditRow(
                 field="Revocation Signals",
-                current_state=f"Certificate publishes {', '.join(state)} references",
-                quantum_status="Revocation metadata present",
+                current_state=f"Certificate publishes {', '.join(refs)} references",
+                quantum_status="Metadata present, active revocation check not performed",
                 remediation="Ensure responders are reachable and monitored",
+                risk_band="Transition",
             )
         )
     else:
@@ -409,15 +441,17 @@ def assess_tls_health(
                 current_state="No OCSP or CRL distribution points found",
                 quantum_status="MEDIUM: Weak revocation ecosystem signalling",
                 remediation="Publish OCSP and or CRL endpoints in certificate profile",
+                risk_band="Transition",
             )
         )
 
     return rows
 
 
-def print_report(target: str, snapshot: TlsSnapshot, rows: list[AuditRow]) -> None:
+def render_table(target: str, original_host: str, snapshot: TlsSnapshot, rows: list[AuditRow]) -> None:
     click.echo("Quantum Risk Audit Report")
     click.echo(f"Target: {target}")
+    click.echo(f"Host: {original_host}")
     click.echo(f"Resolved IP: {snapshot.ip}")
     click.echo(f"Port: {snapshot.port}")
     click.echo("")
@@ -445,20 +479,43 @@ def print_report(target: str, snapshot: TlsSnapshot, rows: list[AuditRow]) -> No
         click.echo(ln)
     click.echo(line("="))
     for row in rows:
-        for ln in render_row((row.field, row.current_state, row.quantum_status, row.remediation)):
+        for ln in render_row((row.field, row.current_state, f"[{row.risk_band}] {row.quantum_status}", row.remediation)):
             click.echo(ln)
         click.echo(line())
+
+
+def build_json(target: str, original_host: str, snapshot: TlsSnapshot, rows: list[AuditRow], assumptions: list[str]) -> dict[str, Any]:
+    return {
+        "tool": "quantum-auditor",
+        "target": target,
+        "host": original_host,
+        "resolved_ip": snapshot.ip,
+        "port": snapshot.port,
+        "negotiated_tls_version": snapshot.tls_version,
+        "negotiated_cipher": snapshot.cipher_name,
+        "assumptions": assumptions,
+        "rows": [asdict(r) for r in rows],
+        "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
 
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.option("--url", "url", required=False, help="Target URL or host to audit on port 443.")
 @click.option("--timeout", default=8.0, show_default=True, type=float, help="Connection timeout in seconds.")
-@click.option(
-    "--remediation-guide",
-    is_flag=True,
-    help="Show the remediation guide and exit.",
-)
-def main(url: Optional[str], timeout: float, remediation_guide: bool) -> None:
+@click.option("--json", "json_output", is_flag=True, help="Emit machine-readable JSON output.")
+@click.option("--insecure", is_flag=True, help="Disable TLS certificate verification for testing only.")
+@click.option("--cafile", type=click.Path(exists=True, dir_okay=False), help="Custom CA bundle file path.")
+@click.option("--skip-legacy-probe", is_flag=True, help="Skip explicit TLS 1.0 and TLS 1.1 probe checks.")
+@click.option("--remediation-guide", is_flag=True, help="Show the remediation guide and exit.")
+def main(
+    url: Optional[str],
+    timeout: float,
+    json_output: bool,
+    insecure: bool,
+    cafile: Optional[str],
+    skip_legacy_probe: bool,
+    remediation_guide: bool,
+) -> None:
     """
     Standalone post-quantum remote security auditor.
 
@@ -474,12 +531,19 @@ def main(url: Optional[str], timeout: float, remediation_guide: bool) -> None:
     if not url:
         raise click.ClickException("Please provide --url <target>.")
 
-    host, port = normalise_target(url)
-    snapshot = capture_tls_snapshot(host, port, timeout)
+    if insecure and cafile:
+        raise click.ClickException("Use either --insecure or --cafile, not both.")
+
+    host, port, original_host = normalise_target(url)
+    snapshot = capture_tls_snapshot(host, port, timeout, insecure, cafile)
     cert = parse_certificate(snapshot.cert_der)
 
-    weak_tls10 = supports_weak_version(host, snapshot.ip, port, ssl.TLSVersion.TLSv1, timeout)
-    weak_tls11 = supports_weak_version(host, snapshot.ip, port, ssl.TLSVersion.TLSv1_1, timeout)
+    if skip_legacy_probe:
+        weak_tls10 = False
+        weak_tls11 = False
+    else:
+        weak_tls10 = supports_legacy_version(host, snapshot.ip, port, ssl.TLSVersion.TLSv1, timeout, insecure, cafile)
+        weak_tls11 = supports_legacy_version(host, snapshot.ip, port, ssl.TLSVersion.TLSv1_1, timeout, insecure, cafile)
 
     rows: list[AuditRow] = []
     rows.extend(assess_tls_health(cert, snapshot.tls_version, weak_tls10, weak_tls11))
@@ -487,7 +551,19 @@ def main(url: Optional[str], timeout: float, remediation_guide: bool) -> None:
     rows.append(assess_grover(snapshot.cipher_name))
     rows.append(assess_shor(cert))
 
-    print_report(url, snapshot, rows)
+    assumptions = [
+        "HNDL assessment uses negotiated cipher naming markers and may miss group-level hybrid negotiation details",
+        "Revocation check validates metadata presence only, not live responder status",
+    ]
+
+    if json_output:
+        click.echo(json.dumps(build_json(url, original_host, snapshot, rows, assumptions), indent=2))
+        return
+
+    render_table(url, original_host, snapshot, rows)
+    click.echo("Assumptions:")
+    for a in assumptions:
+        click.echo(f"- {a}")
 
 
 if __name__ == "__main__":

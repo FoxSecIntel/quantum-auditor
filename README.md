@@ -23,6 +23,11 @@ Standalone post-quantum security auditor for remote HTTPS targets.
   - Current State
   - Quantum Status
   - Remediation
+  - Risk band (Immediate, Transition, Long-term)
+- JSON output mode for automation and CI pipelines
+- Optional TLS trust controls for test environments:
+  - `--insecure` for temporary validation bypass
+  - `--cafile` for custom CA bundle trust
 
 ## Requirements
 
@@ -44,6 +49,10 @@ Optional flags:
 
 ```bash
 ./pqc-audit.py --timeout 8
+./pqc-audit.py --json
+./pqc-audit.py --skip-legacy-probe
+./pqc-audit.py --cafile /path/to/ca-bundle.pem
+./pqc-audit.py --insecure
 ./pqc-audit.py --remediation-guide
 ./pqc-audit.py --help
 ```
