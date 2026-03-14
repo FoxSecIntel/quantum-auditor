@@ -1,5 +1,9 @@
 # quantum-auditor
 
+![CI](https://img.shields.io/github/actions/workflow/status/FoxSecIntel/quantum-auditor/ci.yml?branch=main&label=CI)
+![License](https://img.shields.io/github/license/FoxSecIntel/quantum-auditor)
+![Latest Release](https://img.shields.io/github/v/release/FoxSecIntel/quantum-auditor)
+
 Standalone post-quantum security auditor for remote HTTPS targets.
 
 `quantum-auditor` performs an external Quantum Risk Audit over port 443 only. It does not require local host access, credentials, or agents on the target server.
