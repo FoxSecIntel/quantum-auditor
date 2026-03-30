@@ -120,7 +120,11 @@ func preprocessArgs(args []string) ([]string, []string) {
 		a := args[i]
 		if strings.HasPrefix(a, "-") {
 			clean = append(clean, a)
-			if (a == "-f" || a == "--file" || a == "--concurrency" || a == "--timeout" || a == "--output") && i+1 < len(args) {
+			if (a == "-f" || a == "--file" || a == "-file" ||
+				a == "--concurrency" || a == "-concurrency" ||
+				a == "--timeout" || a == "-timeout" ||
+				a == "--output" || a == "-output" ||
+				a == "--domain" || a == "-domain") && i+1 < len(args) {
 				clean = append(clean, args[i+1])
 				skipNext = true
 			}
