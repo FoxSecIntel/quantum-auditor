@@ -4,9 +4,14 @@
 ![License](https://img.shields.io/github/license/FoxSecIntel/quantum-auditor)
 ![Latest Release](https://img.shields.io/github/v/release/FoxSecIntel/quantum-auditor)
 
-Standalone post-quantum security auditor for remote HTTPS targets.
+Standalone post-quantum security auditor suite for remote HTTPS targets.
 
-`quantum-auditor` performs an external Quantum Risk Audit over port 443 only. It does not require local host access, credentials, or agents on the target server.
+## Tools in this repository
+
+- `pqc-audit.py` (Python): external Quantum Risk Audit over port 443 with HNDL, Grover, and Shor posture checks.
+- `tools/cipher-scan-go/cipher-scan` (Go): high-performance TLS protocol and cipher negotiation scanner with worker-pool batching and table/JSON/CSV/HTML output.
+
+`pqc-audit.py` performs an external Quantum Risk Audit over port 443 only. It does not require local host access, credentials, or agents on the target server.
 
 ## Features
 
