@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"reflect"
 	"runtime"
 	"runtime/debug"
@@ -21,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"text/tabwriter"
 	"time"
 )
@@ -65,6 +67,10 @@ var protocolMatrix = []protocolCheck{
 }
 
 func init() {
+	fmt.Fprintln(os.Stderr, "\n=== PQC Scanner Diagnostics ===")
+	if os.Getenv("PQC_SCANNER_RESTARTED") == "1" {
+		fmt.Fprintln(os.Stderr, "[diag] ✅ Auto-restarted with PQC enabled")
+	}
 	fmt.Fprintf(os.Stderr, "[diag] Runtime Go version: %s\n", runtime.Version())
 	if bi, ok := debug.ReadBuildInfo(); ok {
 		fmt.Fprintf(os.Stderr, "[diag] Build Go version: %s\n", bi.GoVersion)
@@ -75,7 +81,113 @@ func init() {
 	fmt.Fprintf(os.Stderr, "[diag] X25519MLKEM768 constant: 0x%04x (%d)\n", uint16(X25519MLKEM768), uint16(X25519MLKEM768))
 }
 
+func goVersionAtLeast(majorReq, minorReq int) bool {
+	v := strings.TrimPrefix(runtime.Version(), "go")
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minorPart := parts[1]
+	for i, ch := range minorPart {
+		if ch < '0' || ch > '9' {
+			minorPart = minorPart[:i]
+			break
+		}
+	}
+	minor, err2 := strconv.Atoi(minorPart)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	if major > majorReq {
+		return true
+	}
+	if major < majorReq {
+		return false
+	}
+	return minor >= minorReq
+}
+
+func needsPQCRestart() bool {
+	if os.Getenv("PQC_SCANNER_RESTARTED") == "1" {
+		return false
+	}
+	if !goVersionAtLeast(1, 26) {
+		return false
+	}
+	return !strings.Contains(os.Getenv("GODEBUG"), "tlsmlkem=1")
+}
+
+func withTLSMLKEMEnabled(godebug string) string {
+	if godebug == "" {
+		return "tlsmlkem=1"
+	}
+	if strings.Contains(godebug, "tlsmlkem=1") {
+		return godebug
+	}
+	return godebug + ",tlsmlkem=1"
+}
+
+func restartWithPQC() {
+	fmt.Fprintln(os.Stderr, "[info] Go 1.26+ detected. Restarting with GODEBUG=tlsmlkem=1 to enable PQC...")
+
+	env := os.Environ()
+	newEnv := make([]string, 0, len(env)+2)
+	hasGoDebug := false
+	hasMarker := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GODEBUG=") {
+			hasGoDebug = true
+			cur := strings.TrimPrefix(kv, "GODEBUG=")
+			newEnv = append(newEnv, "GODEBUG="+withTLSMLKEMEnabled(cur))
+			continue
+		}
+		if strings.HasPrefix(kv, "PQC_SCANNER_RESTARTED=") {
+			hasMarker = true
+			newEnv = append(newEnv, "PQC_SCANNER_RESTARTED=1")
+			continue
+		}
+		newEnv = append(newEnv, kv)
+	}
+	if !hasGoDebug {
+		newEnv = append(newEnv, "GODEBUG=tlsmlkem=1")
+	}
+	if !hasMarker {
+		newEnv = append(newEnv, "PQC_SCANNER_RESTARTED=1")
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[error] Failed to get executable path: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[error] Please run: GODEBUG=tlsmlkem=1 %s\n", os.Args[0])
+		os.Exit(1)
+	}
+
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command(exe, os.Args[1:]...)
+		cmd.Env = newEnv
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "[error] Failed to auto-enable PQC. Please run: GODEBUG=tlsmlkem=1 %s <domain>\n", os.Args[0])
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	if err := syscall.Exec(exe, os.Args, newEnv); err != nil {
+		fmt.Fprintf(os.Stderr, "[error] Failed to auto-enable PQC. Please run: GODEBUG=tlsmlkem=1 %s <domain>\n", os.Args[0])
+		os.Exit(1)
+	}
+}
+
 func main() {
+	if needsPQCRestart() {
+		restartWithPQC()
+		return
+	}
+
 	var filePath string
 	var concurrency int
 	var timeoutSec int
@@ -125,6 +237,7 @@ func main() {
 		os.Exit(1)
 	}
 	if len(domains) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: cipher-scan [options] <domain> OR cipher-scan --file domains.txt")
 		fmt.Fprintln(os.Stderr, "No domains supplied. Use positional domain or --file.")
 		os.Exit(1)
 	}
