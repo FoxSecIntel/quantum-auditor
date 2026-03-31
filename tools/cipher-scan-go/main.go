@@ -15,7 +15,9 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -50,8 +52,7 @@ type protocolCheck struct {
 }
 
 const (
-	X25519MLKEM768       tls.CurveID = 0x11EC
-	X25519Kyber768Draft0 tls.CurveID = 0x6399
+	X25519MLKEM768 tls.CurveID = 0x11EC
 )
 
 var protocolMatrix = []protocolCheck{
@@ -60,11 +61,6 @@ var protocolMatrix = []protocolCheck{
 	{name: "TLS1.1", version: tls.VersionTLS11},
 	{name: "TLS1.2", version: tls.VersionTLS12},
 	{name: "TLS1.3", version: tls.VersionTLS13},
-}
-
-func init() {
-	// Force-enable Kyber/ML-KEM hybrid support in compatible Go runtimes.
-	os.Setenv("GODEBUG", "tlskyber=1")
 }
 
 func main() {
@@ -89,6 +85,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error initialising flags: %v\n", err)
 		os.Exit(1)
 	}
+
+	warnIfGoVersionOld()
 
 	if mando {
 		decoded, _ := base64.StdEncoding.DecodeString("wqhWaWN0b3J5IGlzIG5vdCB3aW5uaW5nIGZvciBvdXJzZWx2ZXMsIGJ1dCBmb3Igb3RoZXJzLiAtIFRoZSBNYW5kYWxvcmlhbsKoCg==")
@@ -310,53 +308,57 @@ func statusToBoolString(status string) string {
 	return "false"
 }
 
-func pqcCurvePreferences() []tls.CurveID {
-	return []tls.CurveID{X25519MLKEM768, X25519Kyber768Draft0, tls.X25519, tls.CurveP256}
+func warnIfGoVersionOld() {
+	v := strings.TrimPrefix(runtime.Version(), "go")
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 {
+		return
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minorPart := parts[1]
+	for i, ch := range minorPart {
+		if ch < '0' || ch > '9' {
+			minorPart = minorPart[:i]
+			break
+		}
+	}
+	minor, err2 := strconv.Atoi(minorPart)
+	if err1 != nil || err2 != nil {
+		return
+	}
+	if major < 1 || (major == 1 && minor < 24) {
+		fmt.Fprintf(os.Stderr, "Warning: running Go %s. PQC hybrid negotiation may be unavailable before Go 1.24.\n", runtime.Version())
+	}
 }
 
 func pqcCurveLabel(curve tls.CurveID) string {
 	switch curve {
 	case X25519MLKEM768:
 		return "Standard Hybrid (ML-KEM)"
-	case X25519Kyber768Draft0:
-		return "Legacy Hybrid (Kyber)"
 	default:
 		return ""
 	}
 }
 
 func isPQCCurve(curve tls.CurveID) bool {
-	return curve == X25519MLKEM768 || curve == X25519Kyber768Draft0
+	return curve == X25519MLKEM768
 }
 
 func checkPQC(domain string, timeout time.Duration) (status string, cipher string, expiry string, days int, pqcReady bool, strictCurve string, normalCurve string, sans []string, err error) {
-	// Step 1: Strict PQC verification. Offer modern and legacy hybrid groups explicitly.
-	strictState, strictErr := tls13HandshakeWithCurves(domain, timeout, []tls.CurveID{X25519MLKEM768, X25519Kyber768Draft0})
-	if strictErr == nil {
-		label := pqcCurveLabel(strictState.CurveID)
-		if label != "" {
-			strictCurve = fmt.Sprintf("0x%04x (%s)", uint16(strictState.CurveID), label)
-		} else {
-			strictCurve = fmt.Sprintf("0x%04x", uint16(strictState.CurveID))
-		}
-		pqcReady = isPQCCurve(strictState.CurveID)
-	} else {
-		strictCurve = fmt.Sprintf("handshake-failed: %v", strictErr)
+	state, handshakeErr := tls13HandshakeWithCurves(domain, timeout)
+	if handshakeErr != nil {
+		return "failed", "", "", -1, false, "handshake-failed", "handshake-failed", nil, handshakeErr
 	}
 
-	// Step 2: Normal TLS 1.3 handshake for runtime posture and SAN extraction.
-	state, normalErr := tls13HandshakeWithCurves(domain, timeout, pqcCurvePreferences())
-	if normalErr != nil {
-		if strictErr != nil {
-			return "failed", "", "", -1, false, strictCurve, "handshake-failed", nil, fmt.Errorf("normal handshake failed: %v; strict PQC check failed: %v", normalErr, strictErr)
-		}
-		return "failed", "", "", -1, false, strictCurve, "handshake-failed", nil, normalErr
+	curveLabel := pqcCurveLabel(state.CurveID)
+	curveText := fmt.Sprintf("0x%04x", uint16(state.CurveID))
+	if curveLabel != "" {
+		curveText = fmt.Sprintf("%s (%s)", curveText, curveLabel)
 	}
-	if label := pqcCurveLabel(state.CurveID); label != "" {
-		normalCurve = fmt.Sprintf("0x%04x (%s)", uint16(state.CurveID), label)
-	} else {
-		normalCurve = fmt.Sprintf("0x%04x", uint16(state.CurveID))
-	}
+	// Keep fields for backwards output compatibility.
+	strictCurve = curveText
+	normalCurve = curveText
+	pqcReady = isPQCCurve(state.CurveID)
 
 	cipher = tls.CipherSuiteName(state.CipherSuite)
 	if cipher == "" {
@@ -375,7 +377,7 @@ func checkPQC(domain string, timeout time.Duration) (status string, cipher strin
 	return "ok", cipher, expiry, days, pqcReady, strictCurve, normalCurve, sans, nil
 }
 
-func tls13HandshakeWithCurves(domain string, timeout time.Duration, curves []tls.CurveID) (tls.ConnectionState, error) {
+func tls13HandshakeWithCurves(domain string, timeout time.Duration) (tls.ConnectionState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -385,7 +387,6 @@ func tls13HandshakeWithCurves(domain string, timeout time.Duration, curves []tls
 		ServerName:         domain,
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
-		CurvePreferences:   curves,
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
