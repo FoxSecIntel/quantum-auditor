@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+import sys
+if len(sys.argv) > 1 and sys.argv[1] in ("-a", "--author"):
+    print("Author: FoxSecIntel")
+    print("Repository: https://github.com/FoxSecIntel/quantum-auditor
+    print("Tool: pqc-audit.py")
+    raise SystemExit(0)
+
 """
 Standalone Post-Quantum Security Auditor
 
