@@ -62,6 +62,11 @@ var protocolMatrix = []protocolCheck{
 	{name: "TLS1.3", version: tls.VersionTLS13},
 }
 
+func init() {
+	// Force-enable Kyber/ML-KEM hybrid support in compatible Go runtimes.
+	os.Setenv("GODEBUG", "tlskyber=1")
+}
+
 func main() {
 	var filePath string
 	var concurrency int
@@ -336,7 +341,7 @@ func checkPQC(domain string, timeout time.Duration) (status string, cipher strin
 		}
 		pqcReady = isPQCCurve(strictState.CurveID)
 	} else {
-		strictCurve = "handshake-failed"
+		strictCurve = fmt.Sprintf("handshake-failed: %v", strictErr)
 	}
 
 	// Step 2: Normal TLS 1.3 handshake for runtime posture and SAN extraction.
