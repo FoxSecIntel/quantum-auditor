@@ -122,6 +122,26 @@ Produces:
 - `cipher-scan` (Linux)
 - `cipher-scan.exe` (Windows)
 
+### Integrity verification (SHA-256)
+
+Checksums are published in:
+
+- `SHA256SUMS`
+- `SHA256SUMS.txt`
+
+Verify on Linux/macOS:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+Verify on Windows PowerShell:
+
+```powershell
+Get-FileHash .\cipher-scan.exe -Algorithm SHA256
+Get-Content .\SHA256SUMS
+```
+
 ---
 
 ## Usage
