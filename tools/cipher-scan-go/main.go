@@ -66,20 +66,7 @@ var protocolMatrix = []protocolCheck{
 	{name: "TLS1.3", version: tls.VersionTLS13},
 }
 
-func init() {
-	fmt.Fprintln(os.Stderr, "\n=== PQC Scanner Diagnostics ===")
-	if os.Getenv("PQC_SCANNER_RESTARTED") == "1" {
-		fmt.Fprintln(os.Stderr, "[diag] ✅ Auto-restarted with PQC enabled")
-	}
-	fmt.Fprintf(os.Stderr, "[diag] Runtime Go version: %s\n", runtime.Version())
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		fmt.Fprintf(os.Stderr, "[diag] Build Go version: %s\n", bi.GoVersion)
-	} else {
-		fmt.Fprintf(os.Stderr, "[diag] Build Go version: unavailable\n")
-	}
-	fmt.Fprintf(os.Stderr, "[diag] GODEBUG: %s\n", os.Getenv("GODEBUG"))
-	fmt.Fprintf(os.Stderr, "[diag] X25519MLKEM768 constant: 0x%04x (%d)\n", uint16(X25519MLKEM768), uint16(X25519MLKEM768))
-}
+var debugMode bool
 
 func goVersionAtLeast(majorReq, minorReq int) bool {
 	v := strings.TrimPrefix(runtime.Version(), "go")
@@ -182,6 +169,21 @@ func restartWithPQC() {
 	}
 }
 
+func printDiagnosticsHeader() {
+	fmt.Fprintln(os.Stderr, "\n=== PQC Scanner Diagnostics ===")
+	if os.Getenv("PQC_SCANNER_RESTARTED") == "1" {
+		fmt.Fprintln(os.Stderr, "[diag] ✅ Auto-restarted with PQC enabled")
+	}
+	fmt.Fprintf(os.Stderr, "[diag] Runtime Go version: %s\n", runtime.Version())
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		fmt.Fprintf(os.Stderr, "[diag] Build Go version: %s\n", bi.GoVersion)
+	} else {
+		fmt.Fprintf(os.Stderr, "[diag] Build Go version: unavailable\n")
+	}
+	fmt.Fprintf(os.Stderr, "[diag] GODEBUG: %s\n", os.Getenv("GODEBUG"))
+	fmt.Fprintf(os.Stderr, "[diag] X25519MLKEM768 constant: 0x%04x (%d)\n", uint16(X25519MLKEM768), uint16(X25519MLKEM768))
+}
+
 func main() {
 	if needsPQCRestart() {
 		restartWithPQC()
@@ -194,6 +196,7 @@ func main() {
 	var output string
 	var mando bool
 	var author bool
+	var debugFlag bool
 
 	flag.StringVar(&filePath, "file", "", "Path to newline-delimited domains")
 	flag.StringVar(&filePath, "f", "", "Path to newline-delimited domains")
@@ -203,6 +206,7 @@ func main() {
 	flag.BoolVar(&mando, "m", false, "")
 	flag.BoolVar(&mando, "mando", false, "")
 	flag.BoolVar(&author, "a", false, "Show author and repository details")
+	flag.BoolVar(&debugFlag, "debug", false, "Enable diagnostic debug output")
 
 	cleanArgs, positional := preprocessArgs(os.Args[1:])
 	if err := flag.CommandLine.Parse(cleanArgs); err != nil {
@@ -210,6 +214,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	debugMode = debugFlag
+	if debugMode {
+		printDiagnosticsHeader()
+	}
 	warnIfGoVersionOld()
 
 	if mando {
@@ -483,12 +491,14 @@ func checkPQC(domain string, timeout time.Duration) (status string, cipher strin
 		cipher = fmt.Sprintf("0x%04x", state.CipherSuite)
 	}
 
-	fmt.Fprintf(os.Stderr, "[diag] %s TLS version: 0x%04x\n", domain, state.Version)
-	fmt.Fprintf(os.Stderr, "[diag] %s Cipher suite: %s\n", domain, cipher)
-	fmt.Fprintf(os.Stderr, "[diag] %s Negotiated curve: %s (%s)\n", domain, curveID, curveLabel)
-	fmt.Fprintf(os.Stderr, "[diag] %s PQC negotiated: %t\n", domain, pqcReady)
-	if !pqcReady {
-		fmt.Fprintf(os.Stderr, "[diag] %s PQC not negotiated. Check Go version and GODEBUG (for example GODEBUG=tlsmlkem=0 disables ML-KEM).\n", domain)
+	if debugMode {
+		fmt.Fprintf(os.Stderr, "[diag] %s TLS version: 0x%04x\n", domain, state.Version)
+		fmt.Fprintf(os.Stderr, "[diag] %s Cipher suite: %s\n", domain, cipher)
+		fmt.Fprintf(os.Stderr, "[diag] %s Negotiated curve: %s (%s)\n", domain, curveID, curveLabel)
+		fmt.Fprintf(os.Stderr, "[diag] %s PQC negotiated: %t\n", domain, pqcReady)
+		if !pqcReady {
+			fmt.Fprintf(os.Stderr, "[diag] %s PQC not negotiated. Check Go version and GODEBUG (for example GODEBUG=tlsmlkem=0 disables ML-KEM).\n", domain)
+		}
 	}
 
 	days = -1
@@ -657,9 +667,10 @@ func legacyClientHello(serverName string, version uint16) ([]byte, error) {
 
 func emitTable(results []scanResult) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "DOMAIN\tPQC_NEGOTIATED\tCURVE_ID\tCURVE_LABEL")
+	fmt.Fprintln(w, "DOMAIN\tPQC_NEGOTIATED\tCURVE_ID\tCURVE_LABEL\tTLS1.3\tTLS1.2\tTLS1.1\tTLS1.0\tSSLv3\tRELATED DOMAINS\tCERT DAYS\tCERT EXPIRY\tNOTES")
 	for _, r := range results {
-		fmt.Fprintf(w, "%s\t%t\t%s\t%s\n", r.Domain, r.PQCSupported, r.PQCCurveID, r.PQCCurveLabel)
+		fmt.Fprintf(w, "%s\t%t\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+			r.Domain, r.PQCSupported, r.PQCCurveID, r.PQCCurveLabel, r.TLS13, r.TLS12, r.TLS11, r.TLS10, r.SSLv3, sanPreview(r.SubjectAltNames), r.CertDaysRemaining, r.CertExpiry, r.ErrorSummary)
 	}
 	_ = w.Flush()
 }
