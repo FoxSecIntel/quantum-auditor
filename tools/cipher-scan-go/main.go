@@ -49,6 +49,11 @@ type protocolCheck struct {
 	version uint16
 }
 
+const (
+	X25519MLKEM768       tls.CurveID = 0x11EC
+	X25519Kyber768Draft0 tls.CurveID = 0x6399
+)
+
 var protocolMatrix = []protocolCheck{
 	{name: "SSLv3", version: 0x0300},
 	{name: "TLS1.0", version: tls.VersionTLS10},
@@ -249,6 +254,11 @@ func scanDomain(domain string, timeout time.Duration) scanResult {
 			r.PQCNormalCurve = normalCurve
 			if pqcReady {
 				r.Confidence = "High (Handshake Verified)"
+				if strings.Contains(strictCurve, "Standard Hybrid (ML-KEM)") || strings.Contains(normalCurve, "Standard Hybrid (ML-KEM)") {
+					r.Confidence = "High (Handshake Verified, Standard Hybrid (ML-KEM))"
+				} else if strings.Contains(strictCurve, "Legacy Hybrid (Kyber)") || strings.Contains(normalCurve, "Legacy Hybrid (Kyber)") {
+					r.Confidence = "High (Handshake Verified, Legacy Hybrid (Kyber))"
+				}
 			}
 			r.SubjectAltNames = sans
 			if r.CertExpiry == "" && expiry != "" {
@@ -296,18 +306,34 @@ func statusToBoolString(status string) string {
 }
 
 func pqcCurvePreferences() []tls.CurveID {
-	return []tls.CurveID{tls.CurveID(0x11ec), tls.X25519}
+	return []tls.CurveID{X25519MLKEM768, X25519Kyber768Draft0, tls.X25519, tls.CurveP256}
+}
+
+func pqcCurveLabel(curve tls.CurveID) string {
+	switch curve {
+	case X25519MLKEM768:
+		return "Standard Hybrid (ML-KEM)"
+	case X25519Kyber768Draft0:
+		return "Legacy Hybrid (Kyber)"
+	default:
+		return ""
+	}
 }
 
 func isPQCCurve(curve tls.CurveID) bool {
-	return curve == tls.CurveID(0x11ec)
+	return curve == X25519MLKEM768 || curve == X25519Kyber768Draft0
 }
 
 func checkPQC(domain string, timeout time.Duration) (status string, cipher string, expiry string, days int, pqcReady bool, strictCurve string, normalCurve string, sans []string, err error) {
-	// Step 1: Strict PQC verification. Only 0x11ec is offered.
-	strictState, strictErr := tls13HandshakeWithCurves(domain, timeout, []tls.CurveID{tls.CurveID(0x11ec)})
+	// Step 1: Strict PQC verification. Offer modern and legacy hybrid groups explicitly.
+	strictState, strictErr := tls13HandshakeWithCurves(domain, timeout, []tls.CurveID{X25519MLKEM768, X25519Kyber768Draft0})
 	if strictErr == nil {
-		strictCurve = fmt.Sprintf("0x%04x", uint16(strictState.CurveID))
+		label := pqcCurveLabel(strictState.CurveID)
+		if label != "" {
+			strictCurve = fmt.Sprintf("0x%04x (%s)", uint16(strictState.CurveID), label)
+		} else {
+			strictCurve = fmt.Sprintf("0x%04x", uint16(strictState.CurveID))
+		}
 		pqcReady = isPQCCurve(strictState.CurveID)
 	} else {
 		strictCurve = "handshake-failed"
@@ -321,7 +347,11 @@ func checkPQC(domain string, timeout time.Duration) (status string, cipher strin
 		}
 		return "failed", "", "", -1, false, strictCurve, "handshake-failed", nil, normalErr
 	}
-	normalCurve = fmt.Sprintf("0x%04x", uint16(state.CurveID))
+	if label := pqcCurveLabel(state.CurveID); label != "" {
+		normalCurve = fmt.Sprintf("0x%04x (%s)", uint16(state.CurveID), label)
+	} else {
+		normalCurve = fmt.Sprintf("0x%04x", uint16(state.CurveID))
+	}
 
 	cipher = tls.CipherSuiteName(state.CipherSuite)
 	if cipher == "" {
