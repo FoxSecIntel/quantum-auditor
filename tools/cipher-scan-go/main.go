@@ -20,20 +20,22 @@ import (
 )
 
 type scanResult struct {
-	Domain            string `json:"domain" csv:"domain"`
-	SSLv3             string `json:"sslv3" csv:"sslv3"`
-	TLS10             string `json:"tls10" csv:"tls10"`
-	TLS11             string `json:"tls11" csv:"tls11"`
-	TLS12             string `json:"tls12" csv:"tls12"`
-	TLS13             string `json:"tls13" csv:"tls13"`
-	CipherSSLv3       string `json:"cipher_sslv3,omitempty" csv:"cipher_sslv3"`
-	CipherTLS10       string `json:"cipher_tls10,omitempty" csv:"cipher_tls10"`
-	CipherTLS11       string `json:"cipher_tls11,omitempty" csv:"cipher_tls11"`
-	CipherTLS12       string `json:"cipher_tls12,omitempty" csv:"cipher_tls12"`
-	CipherTLS13       string `json:"cipher_tls13,omitempty" csv:"cipher_tls13"`
-	CertExpiry        string `json:"cert_expiry,omitempty" csv:"cert_expiry"`
-	CertDaysRemaining int    `json:"cert_days_remaining" csv:"cert_days_remaining"`
-	ErrorSummary      string `json:"error_summary,omitempty" csv:"error_summary"`
+	Domain            string   `json:"domain" csv:"domain"`
+	SSLv3             string   `json:"sslv3" csv:"sslv3"`
+	TLS10             string   `json:"tls10" csv:"tls10"`
+	TLS11             string   `json:"tls11" csv:"tls11"`
+	TLS12             string   `json:"tls12" csv:"tls12"`
+	TLS13             string   `json:"tls13" csv:"tls13"`
+	PQCSupported      bool     `json:"pqc_supported" csv:"pqc_supported"`
+	SubjectAltNames   []string `json:"subject_alt_names,omitempty" csv:"subject_alt_names"`
+	CipherSSLv3       string   `json:"cipher_sslv3,omitempty" csv:"cipher_sslv3"`
+	CipherTLS10       string   `json:"cipher_tls10,omitempty" csv:"cipher_tls10"`
+	CipherTLS11       string   `json:"cipher_tls11,omitempty" csv:"cipher_tls11"`
+	CipherTLS12       string   `json:"cipher_tls12,omitempty" csv:"cipher_tls12"`
+	CipherTLS13       string   `json:"cipher_tls13,omitempty" csv:"cipher_tls13"`
+	CertExpiry        string   `json:"cert_expiry,omitempty" csv:"cert_expiry"`
+	CertDaysRemaining int      `json:"cert_days_remaining" csv:"cert_days_remaining"`
+	ErrorSummary      string   `json:"error_summary,omitempty" csv:"error_summary"`
 }
 
 type protocolCheck struct {
@@ -233,6 +235,21 @@ func scanDomain(domain string, timeout time.Duration) scanResult {
 	var allErrs []string
 
 	for _, p := range protocolMatrix {
+		if p.name == "TLS1.3" {
+			status, cipher, expiry, days, pqcReady, sans, err := tryTLS13WithPQC(domain, timeout)
+			r.TLS13, r.CipherTLS13 = statusToBoolString(status), cipher
+			r.PQCSupported = pqcReady
+			r.SubjectAltNames = sans
+			if r.CertExpiry == "" && expiry != "" {
+				r.CertExpiry = expiry
+				r.CertDaysRemaining = days
+			}
+			if err != nil {
+				allErrs = append(allErrs, fmt.Sprintf("%s: %v", p.name, err))
+			}
+			continue
+		}
+
 		status, cipher, expiry, days, err := tryHandshake(domain, p.version, timeout)
 		statusDisplay := statusToBoolString(status)
 		switch p.name {
@@ -244,8 +261,6 @@ func scanDomain(domain string, timeout time.Duration) scanResult {
 			r.TLS11, r.CipherTLS11 = statusDisplay, cipher
 		case "TLS1.2":
 			r.TLS12, r.CipherTLS12 = statusDisplay, cipher
-		case "TLS1.3":
-			r.TLS13, r.CipherTLS13 = statusDisplay, cipher
 		}
 		if r.CertExpiry == "" && expiry != "" {
 			r.CertExpiry = expiry
@@ -267,6 +282,56 @@ func statusToBoolString(status string) string {
 		return "true"
 	}
 	return "false"
+}
+
+func pqcCurvePreferences() []tls.CurveID {
+	// 0x11ec and 0x6399 cover known ML-KEM/Kyber hybrid IDs used by major stacks.
+	return []tls.CurveID{tls.CurveID(0x11ec), tls.CurveID(0x6399), tls.X25519}
+}
+
+func isPQCCurve(curve tls.CurveID) bool {
+	return curve == tls.CurveID(0x11ec) || curve == tls.CurveID(0x6399)
+}
+
+func tryTLS13WithPQC(domain string, timeout time.Duration) (status string, cipher string, expiry string, days int, pqcReady bool, sans []string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	dialer := &net.Dialer{Timeout: timeout}
+	addr := net.JoinHostPort(domain, "443")
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+		ServerName:         domain,
+		MinVersion:         tls.VersionTLS13,
+		MaxVersion:         tls.VersionTLS13,
+		CurvePreferences:   pqcCurvePreferences(),
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		return "failed", "", "", -1, false, nil, err
+	}
+	defer conn.Close()
+
+	if err := conn.HandshakeContext(ctx); err != nil {
+		return "failed", "", "", -1, false, nil, err
+	}
+
+	state := conn.ConnectionState()
+	cipher = tls.CipherSuiteName(state.CipherSuite)
+	if cipher == "" {
+		cipher = fmt.Sprintf("0x%04x", state.CipherSuite)
+	}
+	pqcReady = isPQCCurve(state.CurveID)
+
+	days = -1
+	if len(state.PeerCertificates) > 0 {
+		leaf := state.PeerCertificates[0]
+		notAfter := leaf.NotAfter
+		days = int(time.Until(notAfter).Hours() / 24)
+		expiry = notAfter.Format(time.RFC3339)
+		sans = append([]string{}, leaf.DNSNames...)
+	}
+
+	return "ok", cipher, expiry, days, pqcReady, sans, nil
 }
 
 func tryHandshake(domain string, version uint16, timeout time.Duration) (status string, cipher string, expiry string, days int, err error) {
@@ -311,10 +376,10 @@ func tryHandshake(domain string, version uint16, timeout time.Duration) (status 
 
 func emitTable(results []scanResult) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "DOMAIN\tSSLv3\tTLS1.0\tTLS1.1\tTLS1.2\tTLS1.3\tCERT DAYS\tCERT EXPIRY\tNOTES")
+	fmt.Fprintln(w, "DOMAIN\tSSLv3\tTLS1.0\tTLS1.1\tTLS1.2\tTLS1.3\tPQC\tRELATED DOMAINS\tCERT DAYS\tCERT EXPIRY\tNOTES")
 	for _, r := range results {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
-			r.Domain, r.SSLv3, r.TLS10, r.TLS11, r.TLS12, r.TLS13, r.CertDaysRemaining, r.CertExpiry, r.ErrorSummary)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%t\t%s\t%d\t%s\t%s\n",
+			r.Domain, r.SSLv3, r.TLS10, r.TLS11, r.TLS12, r.TLS13, r.PQCSupported, sanPreview(r.SubjectAltNames), r.CertDaysRemaining, r.CertExpiry, r.ErrorSummary)
 	}
 	_ = w.Flush()
 }
@@ -345,13 +410,27 @@ func emitCSV(results []scanResult) {
 }
 
 func emitHTML(results []scanResult) {
-	fmt.Println("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>cipher-scan</title><style>body{font-family:Arial,sans-serif;margin:16px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:6px 8px;font-size:12px;text-align:left}th{background:#f2f2f2}code{white-space:pre-wrap}</style></head><body>")
-	fmt.Println("<h1>cipher-scan report</h1><table><thead><tr><th>Domain</th><th>SSLv3</th><th>TLS1.0</th><th>TLS1.1</th><th>TLS1.2</th><th>TLS1.3</th><th>Cert days</th><th>Cert expiry</th><th>Notes</th></tr></thead><tbody>")
+	fmt.Println("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>cipher-scan</title><style>body{font-family:Arial,sans-serif;margin:16px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:6px 8px;font-size:12px;text-align:left}th{background:#f2f2f2}code{white-space:pre-wrap}.pqc-ready{color:#10b981;font-weight:700}</style></head><body>")
+	fmt.Println("<h1>cipher-scan report</h1><table><thead><tr><th>Domain</th><th>SSLv3</th><th>TLS1.0</th><th>TLS1.1</th><th>TLS1.2</th><th>TLS1.3</th><th>PQC</th><th>Related Domains</th><th>Cert days</th><th>Cert expiry</th><th>Notes</th></tr></thead><tbody>")
 	for _, r := range results {
-		fmt.Printf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%s</td><td><code>%s</code></td></tr>\n",
-			htmlEscape(r.Domain), htmlEscape(r.SSLv3), htmlEscape(r.TLS10), htmlEscape(r.TLS11), htmlEscape(r.TLS12), htmlEscape(r.TLS13), r.CertDaysRemaining, htmlEscape(r.CertExpiry), htmlEscape(r.ErrorSummary))
+		pqcCell := "false"
+		if r.PQCSupported {
+			pqcCell = "<span class=\"pqc-ready\">true</span>"
+		}
+		fmt.Printf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%s</td><td><code>%s</code></td></tr>\n",
+			htmlEscape(r.Domain), htmlEscape(r.SSLv3), htmlEscape(r.TLS10), htmlEscape(r.TLS11), htmlEscape(r.TLS12), htmlEscape(r.TLS13), pqcCell, htmlEscape(sanPreview(r.SubjectAltNames)), r.CertDaysRemaining, htmlEscape(r.CertExpiry), htmlEscape(r.ErrorSummary))
 	}
 	fmt.Println("</tbody></table></body></html>")
+}
+
+func sanPreview(sans []string) string {
+	if len(sans) == 0 {
+		return "-"
+	}
+	if len(sans) <= 3 {
+		return strings.Join(sans, ", ")
+	}
+	return strings.Join(sans[:3], ", ") + ", ..."
 }
 
 func htmlEscape(v string) string {
