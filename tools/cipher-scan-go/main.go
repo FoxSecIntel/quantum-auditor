@@ -55,6 +55,7 @@ func main() {
 	var timeoutSec int
 	var output string
 	var mando bool
+	var author bool
 
 	flag.StringVar(&filePath, "file", "", "Path to newline-delimited domains")
 	flag.StringVar(&filePath, "f", "", "Path to newline-delimited domains")
@@ -63,6 +64,7 @@ func main() {
 	flag.StringVar(&output, "output", "table", "Output format: table, json, csv, html")
 	flag.BoolVar(&mando, "m", false, "")
 	flag.BoolVar(&mando, "mando", false, "")
+	flag.BoolVar(&author, "a", false, "Show author and repository details")
 
 	cleanArgs, positional := preprocessArgs(os.Args[1:])
 	if err := flag.CommandLine.Parse(cleanArgs); err != nil {
@@ -73,6 +75,12 @@ func main() {
 	if mando {
 		decoded, _ := base64.StdEncoding.DecodeString("wqhWaWN0b3J5IGlzIG5vdCB3aW5uaW5nIGZvciBvdXJzZWx2ZXMsIGJ1dCBmb3Igb3RoZXJzLiAtIFRoZSBNYW5kYWxvcmlhbsKoCg==")
 		fmt.Print(string(decoded))
+		return
+	}
+	if author {
+		fmt.Println("Author: FoxSecIntel")
+		fmt.Println("Repository: https://github.com/FoxSecIntel/quantum-auditor")
+		fmt.Println("Tool: cipher-scan (Go)")
 		return
 	}
 
@@ -226,17 +234,18 @@ func scanDomain(domain string, timeout time.Duration) scanResult {
 
 	for _, p := range protocolMatrix {
 		status, cipher, expiry, days, err := tryHandshake(domain, p.version, timeout)
+		statusDisplay := statusToBoolString(status)
 		switch p.name {
 		case "SSLv3":
-			r.SSLv3, r.CipherSSLv3 = status, cipher
+			r.SSLv3, r.CipherSSLv3 = statusDisplay, cipher
 		case "TLS1.0":
-			r.TLS10, r.CipherTLS10 = status, cipher
+			r.TLS10, r.CipherTLS10 = statusDisplay, cipher
 		case "TLS1.1":
-			r.TLS11, r.CipherTLS11 = status, cipher
+			r.TLS11, r.CipherTLS11 = statusDisplay, cipher
 		case "TLS1.2":
-			r.TLS12, r.CipherTLS12 = status, cipher
+			r.TLS12, r.CipherTLS12 = statusDisplay, cipher
 		case "TLS1.3":
-			r.TLS13, r.CipherTLS13 = status, cipher
+			r.TLS13, r.CipherTLS13 = statusDisplay, cipher
 		}
 		if r.CertExpiry == "" && expiry != "" {
 			r.CertExpiry = expiry
@@ -251,6 +260,13 @@ func scanDomain(domain string, timeout time.Duration) scanResult {
 		r.ErrorSummary = strings.Join(allErrs, " | ")
 	}
 	return r
+}
+
+func statusToBoolString(status string) string {
+	if status == "ok" {
+		return "true"
+	}
+	return "false"
 }
 
 func tryHandshake(domain string, version uint16, timeout time.Duration) (status string, cipher string, expiry string, days int, err error) {
