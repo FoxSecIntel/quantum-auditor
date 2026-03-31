@@ -16,6 +16,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,8 +33,8 @@ type scanResult struct {
 	TLS12             string   `json:"tls12" csv:"tls12"`
 	TLS13             string   `json:"tls13" csv:"tls13"`
 	PQCSupported      bool     `json:"pqc_supported" csv:"pqc_supported"`
-	PQCStrictCurve    string   `json:"pqc_strict_curve,omitempty" csv:"pqc_strict_curve"`
-	PQCNormalCurve    string   `json:"pqc_normal_curve,omitempty" csv:"pqc_normal_curve"`
+	PQCCurveID        string   `json:"pqc_curve_id,omitempty" csv:"pqc_curve_id"`
+	PQCCurveLabel     string   `json:"pqc_curve_label,omitempty" csv:"pqc_curve_label"`
 	Confidence        string   `json:"confidence,omitempty" csv:"confidence"`
 	SubjectAltNames   []string `json:"subject_alt_names,omitempty" csv:"subject_alt_names"`
 	CipherSSLv3       string   `json:"cipher_sslv3,omitempty" csv:"cipher_sslv3"`
@@ -61,6 +62,17 @@ var protocolMatrix = []protocolCheck{
 	{name: "TLS1.1", version: tls.VersionTLS11},
 	{name: "TLS1.2", version: tls.VersionTLS12},
 	{name: "TLS1.3", version: tls.VersionTLS13},
+}
+
+func init() {
+	fmt.Fprintf(os.Stderr, "[diag] Runtime Go version: %s\n", runtime.Version())
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		fmt.Fprintf(os.Stderr, "[diag] Build Go version: %s\n", bi.GoVersion)
+	} else {
+		fmt.Fprintf(os.Stderr, "[diag] Build Go version: unavailable\n")
+	}
+	fmt.Fprintf(os.Stderr, "[diag] GODEBUG: %s\n", os.Getenv("GODEBUG"))
+	fmt.Fprintf(os.Stderr, "[diag] X25519MLKEM768 constant: 0x%04x (%d)\n", uint16(X25519MLKEM768), uint16(X25519MLKEM768))
 }
 
 func main() {
@@ -250,18 +262,13 @@ func scanDomain(domain string, timeout time.Duration) scanResult {
 
 	for _, p := range protocolMatrix {
 		if p.name == "TLS1.3" {
-			status, cipher, expiry, days, pqcReady, strictCurve, normalCurve, sans, err := checkPQC(domain, timeout)
+			status, cipher, expiry, days, pqcReady, curveID, curveLabel, sans, err := checkPQC(domain, timeout)
 			r.TLS13, r.CipherTLS13 = statusToBoolString(status), cipher
 			r.PQCSupported = pqcReady
-			r.PQCStrictCurve = strictCurve
-			r.PQCNormalCurve = normalCurve
+			r.PQCCurveID = curveID
+			r.PQCCurveLabel = curveLabel
 			if pqcReady {
 				r.Confidence = "High (Handshake Verified)"
-				if strings.Contains(strictCurve, "Standard Hybrid (ML-KEM)") || strings.Contains(normalCurve, "Standard Hybrid (ML-KEM)") {
-					r.Confidence = "High (Handshake Verified, Standard Hybrid (ML-KEM))"
-				} else if strings.Contains(strictCurve, "Legacy Hybrid (Kyber)") || strings.Contains(normalCurve, "Legacy Hybrid (Kyber)") {
-					r.Confidence = "High (Handshake Verified, Legacy Hybrid (Kyber))"
-				}
 			}
 			r.SubjectAltNames = sans
 			if r.CertExpiry == "" && expiry != "" {
@@ -334,9 +341,13 @@ func warnIfGoVersionOld() {
 func pqcCurveLabel(curve tls.CurveID) string {
 	switch curve {
 	case X25519MLKEM768:
-		return "Standard Hybrid (ML-KEM)"
+		return "X25519MLKEM768 (PQC)"
+	case tls.X25519:
+		return "X25519"
+	case tls.CurveP256:
+		return "P-256"
 	default:
-		return ""
+		return fmt.Sprintf("Unknown(0x%04x)", uint16(curve))
 	}
 }
 
@@ -344,25 +355,27 @@ func isPQCCurve(curve tls.CurveID) bool {
 	return curve == X25519MLKEM768
 }
 
-func checkPQC(domain string, timeout time.Duration) (status string, cipher string, expiry string, days int, pqcReady bool, strictCurve string, normalCurve string, sans []string, err error) {
+func checkPQC(domain string, timeout time.Duration) (status string, cipher string, expiry string, days int, pqcReady bool, curveID string, curveLabel string, sans []string, err error) {
 	state, handshakeErr := tls13HandshakeWithCurves(domain, timeout)
 	if handshakeErr != nil {
 		return "failed", "", "", -1, false, "handshake-failed", "handshake-failed", nil, handshakeErr
 	}
 
-	curveLabel := pqcCurveLabel(state.CurveID)
-	curveText := fmt.Sprintf("0x%04x", uint16(state.CurveID))
-	if curveLabel != "" {
-		curveText = fmt.Sprintf("%s (%s)", curveText, curveLabel)
-	}
-	// Keep fields for backwards output compatibility.
-	strictCurve = curveText
-	normalCurve = curveText
+	curveID = fmt.Sprintf("0x%04x", uint16(state.CurveID))
+	curveLabel = pqcCurveLabel(state.CurveID)
 	pqcReady = isPQCCurve(state.CurveID)
 
 	cipher = tls.CipherSuiteName(state.CipherSuite)
 	if cipher == "" {
 		cipher = fmt.Sprintf("0x%04x", state.CipherSuite)
+	}
+
+	fmt.Fprintf(os.Stderr, "[diag] %s TLS version: 0x%04x\n", domain, state.Version)
+	fmt.Fprintf(os.Stderr, "[diag] %s Cipher suite: %s\n", domain, cipher)
+	fmt.Fprintf(os.Stderr, "[diag] %s Negotiated curve: %s (%s)\n", domain, curveID, curveLabel)
+	fmt.Fprintf(os.Stderr, "[diag] %s PQC negotiated: %t\n", domain, pqcReady)
+	if !pqcReady {
+		fmt.Fprintf(os.Stderr, "[diag] %s PQC not negotiated. Check Go version and GODEBUG (for example GODEBUG=tlsmlkem=0 disables ML-KEM).\n", domain)
 	}
 
 	days = -1
@@ -374,7 +387,7 @@ func checkPQC(domain string, timeout time.Duration) (status string, cipher strin
 		sans = append([]string{}, leaf.DNSNames...)
 	}
 
-	return "ok", cipher, expiry, days, pqcReady, strictCurve, normalCurve, sans, nil
+	return "ok", cipher, expiry, days, pqcReady, curveID, curveLabel, sans, nil
 }
 
 func tls13HandshakeWithCurves(domain string, timeout time.Duration) (tls.ConnectionState, error) {
@@ -531,10 +544,9 @@ func legacyClientHello(serverName string, version uint16) ([]byte, error) {
 
 func emitTable(results []scanResult) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "DOMAIN\tSSLv3\tTLS1.0\tTLS1.1\tTLS1.2\tTLS1.3\tPQC\tPQC STRICT\tPQC NORMAL\tCONFIDENCE\tRELATED DOMAINS\tCERT DAYS\tCERT EXPIRY\tNOTES")
+	fmt.Fprintln(w, "DOMAIN\tPQC_NEGOTIATED\tCURVE_ID\tCURVE_LABEL")
 	for _, r := range results {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
-			r.Domain, r.SSLv3, r.TLS10, r.TLS11, r.TLS12, r.TLS13, r.PQCSupported, r.PQCStrictCurve, r.PQCNormalCurve, r.Confidence, sanPreview(r.SubjectAltNames), r.CertDaysRemaining, r.CertExpiry, r.ErrorSummary)
+		fmt.Fprintf(w, "%s\t%t\t%s\t%s\n", r.Domain, r.PQCSupported, r.PQCCurveID, r.PQCCurveLabel)
 	}
 	_ = w.Flush()
 }
@@ -566,14 +578,14 @@ func emitCSV(results []scanResult) {
 
 func emitHTML(results []scanResult) {
 	fmt.Println("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>cipher-scan</title><style>body{font-family:Arial,sans-serif;margin:16px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:6px 8px;font-size:12px;text-align:left}th{background:#f2f2f2}code{white-space:pre-wrap}.pqc-ready{color:#10b981;font-weight:700}</style></head><body>")
-	fmt.Println("<h1>cipher-scan report</h1><table><thead><tr><th>Domain</th><th>SSLv3</th><th>TLS1.0</th><th>TLS1.1</th><th>TLS1.2</th><th>TLS1.3</th><th>PQC</th><th>PQC Strict</th><th>PQC Normal</th><th>Confidence</th><th>Related Domains</th><th>Cert days</th><th>Cert expiry</th><th>Notes</th></tr></thead><tbody>")
+	fmt.Println("<h1>cipher-scan report</h1><table><thead><tr><th>Domain</th><th>PQC Negotiated</th><th>Curve ID</th><th>Curve Label</th><th>TLS1.3</th><th>Cipher</th><th>Related Domains</th><th>Cert days</th><th>Cert expiry</th><th>Notes</th></tr></thead><tbody>")
 	for _, r := range results {
 		pqcCell := "false"
 		if r.PQCSupported {
 			pqcCell = "<span class=\"pqc-ready\">true</span>"
 		}
-		fmt.Printf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%s</td><td><code>%s</code></td></tr>\n",
-			htmlEscape(r.Domain), htmlEscape(r.SSLv3), htmlEscape(r.TLS10), htmlEscape(r.TLS11), htmlEscape(r.TLS12), htmlEscape(r.TLS13), pqcCell, htmlEscape(r.PQCStrictCurve), htmlEscape(r.PQCNormalCurve), htmlEscape(r.Confidence), htmlEscape(sanPreview(r.SubjectAltNames)), r.CertDaysRemaining, htmlEscape(r.CertExpiry), htmlEscape(r.ErrorSummary))
+		fmt.Printf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%s</td><td><code>%s</code></td></tr>\n",
+			htmlEscape(r.Domain), pqcCell, htmlEscape(r.PQCCurveID), htmlEscape(r.PQCCurveLabel), htmlEscape(r.TLS13), htmlEscape(r.CipherTLS13), htmlEscape(sanPreview(r.SubjectAltNames)), r.CertDaysRemaining, htmlEscape(r.CertExpiry), htmlEscape(r.ErrorSummary))
 	}
 	fmt.Println("</tbody></table></body></html>")
 }
