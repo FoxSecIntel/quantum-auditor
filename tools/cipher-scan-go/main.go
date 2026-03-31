@@ -3,12 +3,15 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"reflect"
@@ -27,6 +30,7 @@ type scanResult struct {
 	TLS12             string   `json:"tls12" csv:"tls12"`
 	TLS13             string   `json:"tls13" csv:"tls13"`
 	PQCSupported      bool     `json:"pqc_supported" csv:"pqc_supported"`
+	Confidence        string   `json:"confidence,omitempty" csv:"confidence"`
 	SubjectAltNames   []string `json:"subject_alt_names,omitempty" csv:"subject_alt_names"`
 	CipherSSLv3       string   `json:"cipher_sslv3,omitempty" csv:"cipher_sslv3"`
 	CipherTLS10       string   `json:"cipher_tls10,omitempty" csv:"cipher_tls10"`
@@ -236,9 +240,12 @@ func scanDomain(domain string, timeout time.Duration) scanResult {
 
 	for _, p := range protocolMatrix {
 		if p.name == "TLS1.3" {
-			status, cipher, expiry, days, pqcReady, sans, err := tryTLS13WithPQC(domain, timeout)
+			status, cipher, expiry, days, pqcReady, sans, err := checkPQC(domain, timeout)
 			r.TLS13, r.CipherTLS13 = statusToBoolString(status), cipher
 			r.PQCSupported = pqcReady
+			if pqcReady {
+				r.Confidence = "High (Handshake Verified)"
+			}
 			r.SubjectAltNames = sans
 			if r.CertExpiry == "" && expiry != "" {
 				r.CertExpiry = expiry
@@ -285,15 +292,14 @@ func statusToBoolString(status string) string {
 }
 
 func pqcCurvePreferences() []tls.CurveID {
-	// 0x11ec and 0x6399 cover known ML-KEM/Kyber hybrid IDs used by major stacks.
-	return []tls.CurveID{tls.CurveID(0x11ec), tls.CurveID(0x6399), tls.X25519}
+	return []tls.CurveID{tls.CurveID(0x11ec), tls.X25519}
 }
 
 func isPQCCurve(curve tls.CurveID) bool {
-	return curve == tls.CurveID(0x11ec) || curve == tls.CurveID(0x6399)
+	return curve == tls.CurveID(0x11ec)
 }
 
-func tryTLS13WithPQC(domain string, timeout time.Duration) (status string, cipher string, expiry string, days int, pqcReady bool, sans []string, err error) {
+func checkPQC(domain string, timeout time.Duration) (status string, cipher string, expiry string, days int, pqcReady bool, sans []string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -324,17 +330,35 @@ func tryTLS13WithPQC(domain string, timeout time.Duration) (status string, ciphe
 
 	days = -1
 	if len(state.PeerCertificates) > 0 {
+		type sanData struct {
+			names  []string
+			expiry string
+			days   int
+		}
+		sanCh := make(chan sanData, 1)
 		leaf := state.PeerCertificates[0]
-		notAfter := leaf.NotAfter
-		days = int(time.Until(notAfter).Hours() / 24)
-		expiry = notAfter.Format(time.RFC3339)
-		sans = append([]string{}, leaf.DNSNames...)
+		go func() {
+			notAfter := leaf.NotAfter
+			sanCh <- sanData{
+				names:  append([]string{}, leaf.DNSNames...),
+				expiry: notAfter.Format(time.RFC3339),
+				days:   int(time.Until(notAfter).Hours() / 24),
+			}
+		}()
+		s := <-sanCh
+		sans = s.names
+		expiry = s.expiry
+		days = s.days
 	}
 
 	return "ok", cipher, expiry, days, pqcReady, sans, nil
 }
 
 func tryHandshake(domain string, version uint16, timeout time.Duration) (status string, cipher string, expiry string, days int, err error) {
+	if version <= tls.VersionTLS11 {
+		return tryLegacyProbe(domain, version, timeout)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -347,9 +371,6 @@ func tryHandshake(domain string, version uint16, timeout time.Duration) (status 
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
-		if version == 0x0300 && strings.Contains(strings.ToLower(err.Error()), "unsupported") {
-			return "unsupported", "", "", -1, err
-		}
 		return "failed", "", "", -1, err
 	}
 	defer conn.Close()
@@ -374,12 +395,99 @@ func tryHandshake(domain string, version uint16, timeout time.Duration) (status 
 	return "ok", cipher, expiry, days, nil
 }
 
+func tryLegacyProbe(domain string, version uint16, timeout time.Duration) (status string, cipher string, expiry string, days int, err error) {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(domain, "443"), timeout)
+	if err != nil {
+		return "failed", "", "", -1, err
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	hello, err := legacyClientHello(domain, version)
+	if err != nil {
+		return "failed", "", "", -1, err
+	}
+	if _, err := conn.Write(hello); err != nil {
+		return "failed", "", "", -1, err
+	}
+
+	resp := make([]byte, 5)
+	n, err := io.ReadAtLeast(conn, resp, 5)
+	if err != nil {
+		return "failed", "", "", -1, err
+	}
+	if n == 5 {
+		// 22 is Handshake (potential support), 21 is Alert (usually rejection).
+		if resp[0] == 22 {
+			return "ok", "legacy-probe", "", -1, nil
+		}
+		return "failed", "", "", -1, fmt.Errorf("legacy handshake rejected")
+	}
+	return "failed", "", "", -1, fmt.Errorf("no legacy response")
+}
+
+func legacyClientHello(serverName string, version uint16) ([]byte, error) {
+	random := make([]byte, 32)
+	if _, err := rand.Read(random); err != nil {
+		return nil, err
+	}
+	sessionID := []byte{}
+	cipherSuites := []uint16{0x002f, 0x0035, 0xc02f, 0xc030, 0x000a}
+	compressionMethods := []byte{0x00}
+
+	host := []byte(serverName)
+	sni := make([]byte, 0)
+	// SNI extension
+	sni = append(sni, 0x00, 0x00)
+	serverNameListLen := 1 + 2 + len(host)
+	extLen := 2 + serverNameListLen
+	sni = append(sni, byte(extLen>>8), byte(extLen))
+	sni = append(sni, byte(serverNameListLen>>8), byte(serverNameListLen))
+	sni = append(sni, 0x00)
+	sni = append(sni, byte(len(host)>>8), byte(len(host)))
+	sni = append(sni, host...)
+
+	extensions := sni
+
+	body := make([]byte, 0)
+	body = append(body, byte(version>>8), byte(version))
+	body = append(body, random...)
+	body = append(body, byte(len(sessionID)))
+	body = append(body, sessionID...)
+
+	csLen := len(cipherSuites) * 2
+	body = append(body, byte(csLen>>8), byte(csLen))
+	for _, cs := range cipherSuites {
+		body = append(body, byte(cs>>8), byte(cs))
+	}
+
+	body = append(body, byte(len(compressionMethods)))
+	body = append(body, compressionMethods...)
+	body = append(body, byte(len(extensions)>>8), byte(len(extensions)))
+	body = append(body, extensions...)
+
+	handshake := make([]byte, 4)
+	handshake[0] = 0x01
+	handshakeLen := len(body)
+	handshake[1] = byte(handshakeLen >> 16)
+	handshake[2] = byte(handshakeLen >> 8)
+	handshake[3] = byte(handshakeLen)
+	handshake = append(handshake, body...)
+
+	record := make([]byte, 5)
+	record[0] = 0x16
+	binary.BigEndian.PutUint16(record[1:3], version)
+	binary.BigEndian.PutUint16(record[3:5], uint16(len(handshake)))
+	record = append(record, handshake...)
+	return record, nil
+}
+
 func emitTable(results []scanResult) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "DOMAIN\tSSLv3\tTLS1.0\tTLS1.1\tTLS1.2\tTLS1.3\tPQC\tRELATED DOMAINS\tCERT DAYS\tCERT EXPIRY\tNOTES")
+	fmt.Fprintln(w, "DOMAIN\tSSLv3\tTLS1.0\tTLS1.1\tTLS1.2\tTLS1.3\tPQC\tCONFIDENCE\tRELATED DOMAINS\tCERT DAYS\tCERT EXPIRY\tNOTES")
 	for _, r := range results {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%t\t%s\t%d\t%s\t%s\n",
-			r.Domain, r.SSLv3, r.TLS10, r.TLS11, r.TLS12, r.TLS13, r.PQCSupported, sanPreview(r.SubjectAltNames), r.CertDaysRemaining, r.CertExpiry, r.ErrorSummary)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%t\t%s\t%s\t%d\t%s\t%s\n",
+			r.Domain, r.SSLv3, r.TLS10, r.TLS11, r.TLS12, r.TLS13, r.PQCSupported, r.Confidence, sanPreview(r.SubjectAltNames), r.CertDaysRemaining, r.CertExpiry, r.ErrorSummary)
 	}
 	_ = w.Flush()
 }
@@ -411,14 +519,14 @@ func emitCSV(results []scanResult) {
 
 func emitHTML(results []scanResult) {
 	fmt.Println("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>cipher-scan</title><style>body{font-family:Arial,sans-serif;margin:16px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:6px 8px;font-size:12px;text-align:left}th{background:#f2f2f2}code{white-space:pre-wrap}.pqc-ready{color:#10b981;font-weight:700}</style></head><body>")
-	fmt.Println("<h1>cipher-scan report</h1><table><thead><tr><th>Domain</th><th>SSLv3</th><th>TLS1.0</th><th>TLS1.1</th><th>TLS1.2</th><th>TLS1.3</th><th>PQC</th><th>Related Domains</th><th>Cert days</th><th>Cert expiry</th><th>Notes</th></tr></thead><tbody>")
+	fmt.Println("<h1>cipher-scan report</h1><table><thead><tr><th>Domain</th><th>SSLv3</th><th>TLS1.0</th><th>TLS1.1</th><th>TLS1.2</th><th>TLS1.3</th><th>PQC</th><th>Confidence</th><th>Related Domains</th><th>Cert days</th><th>Cert expiry</th><th>Notes</th></tr></thead><tbody>")
 	for _, r := range results {
 		pqcCell := "false"
 		if r.PQCSupported {
 			pqcCell = "<span class=\"pqc-ready\">true</span>"
 		}
-		fmt.Printf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%s</td><td><code>%s</code></td></tr>\n",
-			htmlEscape(r.Domain), htmlEscape(r.SSLv3), htmlEscape(r.TLS10), htmlEscape(r.TLS11), htmlEscape(r.TLS12), htmlEscape(r.TLS13), pqcCell, htmlEscape(sanPreview(r.SubjectAltNames)), r.CertDaysRemaining, htmlEscape(r.CertExpiry), htmlEscape(r.ErrorSummary))
+		fmt.Printf("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td><td>%s</td><td><code>%s</code></td></tr>\n",
+			htmlEscape(r.Domain), htmlEscape(r.SSLv3), htmlEscape(r.TLS10), htmlEscape(r.TLS11), htmlEscape(r.TLS12), htmlEscape(r.TLS13), pqcCell, htmlEscape(r.Confidence), htmlEscape(sanPreview(r.SubjectAltNames)), r.CertDaysRemaining, htmlEscape(r.CertExpiry), htmlEscape(r.ErrorSummary))
 	}
 	fmt.Println("</tbody></table></body></html>")
 }
