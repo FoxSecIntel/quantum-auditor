@@ -300,6 +300,39 @@ func isPQCCurve(curve tls.CurveID) bool {
 }
 
 func checkPQC(domain string, timeout time.Duration) (status string, cipher string, expiry string, days int, pqcReady bool, sans []string, err error) {
+	// Step 1: Strict PQC verification. Only 0x11ec is offered.
+	strictState, strictErr := tls13HandshakeWithCurves(domain, timeout, []tls.CurveID{tls.CurveID(0x11ec)})
+	if strictErr == nil {
+		pqcReady = isPQCCurve(strictState.CurveID)
+	}
+
+	// Step 2: Normal TLS 1.3 handshake for runtime posture and SAN extraction.
+	state, normalErr := tls13HandshakeWithCurves(domain, timeout, pqcCurvePreferences())
+	if normalErr != nil {
+		if strictErr != nil {
+			return "failed", "", "", -1, false, nil, fmt.Errorf("normal handshake failed: %v; strict PQC check failed: %v", normalErr, strictErr)
+		}
+		return "failed", "", "", -1, false, nil, normalErr
+	}
+
+	cipher = tls.CipherSuiteName(state.CipherSuite)
+	if cipher == "" {
+		cipher = fmt.Sprintf("0x%04x", state.CipherSuite)
+	}
+
+	days = -1
+	if len(state.PeerCertificates) > 0 {
+		leaf := state.PeerCertificates[0]
+		notAfter := leaf.NotAfter
+		days = int(time.Until(notAfter).Hours() / 24)
+		expiry = notAfter.Format(time.RFC3339)
+		sans = append([]string{}, leaf.DNSNames...)
+	}
+
+	return "ok", cipher, expiry, days, pqcReady, sans, nil
+}
+
+func tls13HandshakeWithCurves(domain string, timeout time.Duration, curves []tls.CurveID) (tls.ConnectionState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -309,49 +342,19 @@ func checkPQC(domain string, timeout time.Duration) (status string, cipher strin
 		ServerName:         domain,
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
-		CurvePreferences:   pqcCurvePreferences(),
+		CurvePreferences:   curves,
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
-		return "failed", "", "", -1, false, nil, err
+		return tls.ConnectionState{}, err
 	}
 	defer conn.Close()
 
 	if err := conn.HandshakeContext(ctx); err != nil {
-		return "failed", "", "", -1, false, nil, err
+		return tls.ConnectionState{}, err
 	}
 
-	state := conn.ConnectionState()
-	cipher = tls.CipherSuiteName(state.CipherSuite)
-	if cipher == "" {
-		cipher = fmt.Sprintf("0x%04x", state.CipherSuite)
-	}
-	pqcReady = isPQCCurve(state.CurveID)
-
-	days = -1
-	if len(state.PeerCertificates) > 0 {
-		type sanData struct {
-			names  []string
-			expiry string
-			days   int
-		}
-		sanCh := make(chan sanData, 1)
-		leaf := state.PeerCertificates[0]
-		go func() {
-			notAfter := leaf.NotAfter
-			sanCh <- sanData{
-				names:  append([]string{}, leaf.DNSNames...),
-				expiry: notAfter.Format(time.RFC3339),
-				days:   int(time.Until(notAfter).Hours() / 24),
-			}
-		}()
-		s := <-sanCh
-		sans = s.names
-		expiry = s.expiry
-		days = s.days
-	}
-
-	return "ok", cipher, expiry, days, pqcReady, sans, nil
+	return conn.ConnectionState(), nil
 }
 
 func tryHandshake(domain string, version uint16, timeout time.Duration) (status string, cipher string, expiry string, days int, err error) {
