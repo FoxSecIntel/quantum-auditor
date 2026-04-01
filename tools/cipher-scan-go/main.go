@@ -193,6 +193,7 @@ func main() {
 	var filePath string
 	var concurrency int
 	var timeoutSec int
+	var port int
 	var output string
 	var mando bool
 	var author bool
@@ -202,6 +203,7 @@ func main() {
 	flag.StringVar(&filePath, "f", "", "Path to newline-delimited domains")
 	flag.IntVar(&concurrency, "concurrency", 20, "Number of workers")
 	flag.IntVar(&timeoutSec, "timeout", 8, "Timeout in seconds per domain")
+	flag.IntVar(&port, "port", 443, "Target TCP port")
 	flag.StringVar(&output, "output", "table", "Output format: table, json, csv, html")
 	flag.BoolVar(&mando, "m", false, "")
 	flag.BoolVar(&mando, "mando", false, "")
@@ -238,6 +240,10 @@ func main() {
 	if timeoutSec < 5 {
 		timeoutSec = 5
 	}
+	if port < 1 || port > 65535 {
+		fmt.Fprintln(os.Stderr, "Invalid --port value. Must be between 1 and 65535.")
+		os.Exit(2)
+	}
 
 	domains, err := loadDomains(filePath, positional)
 	if err != nil {
@@ -250,7 +256,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	results := runWorkerPool(domains, concurrency, time.Duration(timeoutSec)*time.Second)
+	results := runWorkerPool(domains, concurrency, time.Duration(timeoutSec)*time.Second, port)
 
 	switch strings.ToLower(output) {
 	case "json":
@@ -280,6 +286,7 @@ func preprocessArgs(args []string) ([]string, []string) {
 			if (a == "-f" || a == "--file" || a == "-file" ||
 				a == "--concurrency" || a == "-concurrency" ||
 				a == "--timeout" || a == "-timeout" ||
+				a == "--port" || a == "-port" ||
 				a == "--output" || a == "-output" ||
 				a == "--domain" || a == "-domain") && i+1 < len(args) {
 				clean = append(clean, args[i+1])
@@ -345,7 +352,7 @@ func normaliseDomain(v string) string {
 	return v
 }
 
-func runWorkerPool(domains []string, workers int, timeout time.Duration) []scanResult {
+func runWorkerPool(domains []string, workers int, timeout time.Duration, port int) []scanResult {
 	jobs := make(chan string)
 	results := make(chan scanResult)
 	var wg sync.WaitGroup
@@ -355,7 +362,7 @@ func runWorkerPool(domains []string, workers int, timeout time.Duration) []scanR
 		go func() {
 			defer wg.Done()
 			for d := range jobs {
-				results <- scanDomain(d, timeout)
+				results <- scanDomain(d, timeout, port)
 			}
 		}()
 	}
@@ -377,13 +384,13 @@ func runWorkerPool(domains []string, workers int, timeout time.Duration) []scanR
 	return out
 }
 
-func scanDomain(domain string, timeout time.Duration) scanResult {
+func scanDomain(domain string, timeout time.Duration, port int) scanResult {
 	r := scanResult{Domain: domain, CertDaysRemaining: -1}
 	var allErrs []string
 
 	for _, p := range protocolMatrix {
 		if p.name == "TLS1.3" {
-			status, cipher, expiry, days, pqcReady, curveID, curveLabel, sans, err := checkPQC(domain, timeout)
+			status, cipher, expiry, days, pqcReady, curveID, curveLabel, sans, err := checkPQC(domain, timeout, port)
 			r.TLS13, r.CipherTLS13 = statusToBoolString(status), cipher
 			r.PQCSupported = pqcReady
 			r.PQCCurveID = curveID
@@ -402,7 +409,7 @@ func scanDomain(domain string, timeout time.Duration) scanResult {
 			continue
 		}
 
-		status, cipher, expiry, days, err := tryHandshake(domain, p.version, timeout)
+		status, cipher, expiry, days, err := tryHandshake(domain, p.version, timeout, port)
 		statusDisplay := statusToBoolString(status)
 		switch p.name {
 		case "SSLv3":
@@ -476,8 +483,8 @@ func isPQCCurve(curve tls.CurveID) bool {
 	return curve == X25519MLKEM768
 }
 
-func checkPQC(domain string, timeout time.Duration) (status string, cipher string, expiry string, days int, pqcReady bool, curveID string, curveLabel string, sans []string, err error) {
-	state, handshakeErr := tls13HandshakeWithCurves(domain, timeout)
+func checkPQC(domain string, timeout time.Duration, port int) (status string, cipher string, expiry string, days int, pqcReady bool, curveID string, curveLabel string, sans []string, err error) {
+	state, handshakeErr := tls13HandshakeWithCurves(domain, timeout, port)
 	if handshakeErr != nil {
 		return "failed", "", "", -1, false, "handshake-failed", "handshake-failed", nil, handshakeErr
 	}
@@ -513,12 +520,12 @@ func checkPQC(domain string, timeout time.Duration) (status string, cipher strin
 	return "ok", cipher, expiry, days, pqcReady, curveID, curveLabel, sans, nil
 }
 
-func tls13HandshakeWithCurves(domain string, timeout time.Duration) (tls.ConnectionState, error) {
+func tls13HandshakeWithCurves(domain string, timeout time.Duration, port int) (tls.ConnectionState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	dialer := &net.Dialer{Timeout: timeout}
-	addr := net.JoinHostPort(domain, "443")
+	addr := net.JoinHostPort(domain, strconv.Itoa(port))
 	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
 		ServerName:         domain,
 		MinVersion:         tls.VersionTLS13,
@@ -537,16 +544,16 @@ func tls13HandshakeWithCurves(domain string, timeout time.Duration) (tls.Connect
 	return conn.ConnectionState(), nil
 }
 
-func tryHandshake(domain string, version uint16, timeout time.Duration) (status string, cipher string, expiry string, days int, err error) {
+func tryHandshake(domain string, version uint16, timeout time.Duration, port int) (status string, cipher string, expiry string, days int, err error) {
 	if version <= tls.VersionTLS11 {
-		return tryLegacyProbe(domain, version, timeout)
+		return tryLegacyProbe(domain, version, timeout, port)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	dialer := &net.Dialer{Timeout: timeout}
-	addr := net.JoinHostPort(domain, "443")
+	addr := net.JoinHostPort(domain, strconv.Itoa(port))
 	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
 		ServerName:         domain,
 		MinVersion:         version,
@@ -578,8 +585,8 @@ func tryHandshake(domain string, version uint16, timeout time.Duration) (status 
 	return "ok", cipher, expiry, days, nil
 }
 
-func tryLegacyProbe(domain string, version uint16, timeout time.Duration) (status string, cipher string, expiry string, days int, err error) {
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(domain, "443"), timeout)
+func tryLegacyProbe(domain string, version uint16, timeout time.Duration, port int) (status string, cipher string, expiry string, days int, err error) {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(domain, strconv.Itoa(port)), timeout)
 	if err != nil {
 		return "failed", "", "", -1, err
 	}
